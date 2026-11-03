@@ -1,0 +1,109 @@
+name: Build TimeControl APK
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'TimeControl_Source.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: timecontrol-android-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="TimeControl_Source.zip"
+          if [ ! -f "$ARCHIVE" ]; then
+            echo "::error::Upload TimeControl_Source.zip to the repository root."
+            exit 1
+          fi
+          mkdir -p _source
+          unzip -q "$ARCHIVE" -d _source
+          if [ ! -f "_source/pubspec.yaml" ]; then
+            echo "::error::Archive must contain pubspec.yaml at its root."
+            find _source -maxdepth 3 -type f | head -80
+            exit 1
+          fi
+          rsync -a _source/ ./
+          rm -rf _source
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android platform files if absent
+        run: |
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.timecontrol .
+          fi
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Verify APK and create APK-only ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+          mkdir -p release
+          cp "$APK" release/TimeControl.apk
+          (cd release && zip -q TimeControl_APK.zip TimeControl.apk)
+          test -s release/TimeControl_APK.zip
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TimeControl-Android
+          path: |
+            release/TimeControl.apk
+            release/TimeControl_APK.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Save expanded source and remove uploaded archive
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f TimeControl_Source.zip
+          git add -A -- . ':!release'
+          git add -u
+          if ! git diff --cached --quiet; then
+            git commit -m "build: save TimeControl source and remove upload archive"
+            git push
+          fi
