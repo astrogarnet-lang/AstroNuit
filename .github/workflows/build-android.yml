@@ -1,0 +1,108 @@
+name: Build AstroNuit Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'AstroNuit-AI-Android-Foundation-*.zip'
+      - '.github/workflows/build-android.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    name: Analyze, test and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Locate AstroNuit source archive
+        id: archive
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(AstroNuit-AI-Android-Foundation-*.zip)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No AstroNuit-AI-Android-Foundation-*.zip found in repo root."
+            exit 1
+          fi
+          IFS=$'\n' files=($(printf '%s\n' "${files[@]}" | sort))
+          echo "zip=${files[-1]}" >> "$GITHUB_OUTPUT"
+          echo "Using ${files[-1]}"
+
+      - name: Unpack into temporary workspace (not repo root)
+        id: src
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/astronuit-src"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          unzip -oq "${{ steps.archive.outputs.zip }}" -d "$WORK"
+          entries=("$WORK"/*)
+          if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+            WORK="${entries[0]}"
+          fi
+          echo "dir=$WORK" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android platform scaffold
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: bash tool/bootstrap_android.sh
+
+      - name: Resolve dependencies
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter pub get
+
+      - name: Analyze source
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter analyze --no-pub
+
+      - name: Run tests
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter test --no-pub
+
+      - name: Build Android APK
+        working-directory: ${{ steps.src.outputs.dir }}
+        timeout-minutes: 55
+        run: flutter build apk --release --no-pub
+
+      - name: Upload installable APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: astronuit-android-apk
+          path: ${{ steps.src.outputs.dir }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean repository root (keep only .github)
+        if: always()
+        run: |
+          set -euo pipefail
+          for entry in * .[!.]* ..?*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            case "$entry" in
+              .git|.github) continue ;;
+            esac
+            echo "Removing: $entry"
+            rm -rf -- "$entry"
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- . ':!.github' ':!.github/**'
+          if git diff --cached --quiet; then
+            echo "Already clean"
+            exit 0
+          fi
+          git commit -m "chore: clean repo root after AstroNuit build"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
