@@ -1,0 +1,142 @@
+name: Build TimeControl Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'TimeControl_Source.zip'
+      - 'TimeControl*.zip'
+      - '.github/workflows/build-apk.yml'
+
+# contents:write — cleanup commit only (never touches .github → no workflows permission)
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Analyze, test and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate source archive
+        id: zip
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(TimeControl_Source.zip TimeControl*.zip)
+          # Prefer exact name, else first match that is a zip in root
+          chosen=""
+          for f in TimeControl_Source.zip TimeControl*.zip; do
+            if [[ -f "$f" ]]; then chosen="$f"; break; fi
+          done
+          if [[ -z "$chosen" ]]; then
+            echo "No TimeControl source ZIP found in repository root."
+            exit 1
+          fi
+          echo "zip=$chosen" >> "$GITHUB_OUTPUT"
+          echo "Using $chosen"
+
+      - name: Unpack into temporary workspace (not repo root)
+        id: src
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/timecontrol-src"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          unzip -oq "${{ steps.zip.outputs.zip }}" -d "$WORK"
+          # If archive has a single top-level folder, enter it
+          entries=("$WORK"/*)
+          if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+            WORK="${entries[0]}"
+          fi
+          echo "dir=$WORK" >> "$GITHUB_OUTPUT"
+          ls -la "$WORK"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android platform if needed
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.timecontrol --project-name timecontrol .
+          fi
+
+      - name: Dependencies
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter analyze --no-pub
+
+      - name: Test
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter test --no-pub
+
+      - name: Build APK
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter build apk --release --no-pub
+
+      - name: Package APK
+        if: success()
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          set -euo pipefail
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$APK" "$RUNNER_TEMP/release/TimeControl.apk"
+          (cd "$RUNNER_TEMP/release" && zip -q TimeControl_APK.zip TimeControl.apk)
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TimeControl-Android
+          path: |
+            ${{ runner.temp }}/release/TimeControl.apk
+            ${{ runner.temp }}/release/TimeControl_APK.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Clean repo root (keep only .github)
+        if: always()
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_REF_NAME}"
+
+          git fetch origin "$branch" || true
+          if git rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+            git reset --hard "origin/$branch"
+          fi
+
+          for entry in * .[!.]* ..?*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            case "$entry" in
+              .git|.github) continue ;;
+            esac
+            echo "Removing: $entry"
+            rm -rf -- "$entry"
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- . ':!.github' ':!.github/**'
+          if git diff --cached --quiet; then
+            echo "Already clean"
+            exit 0
+          fi
+          git commit -m "chore: clean repo root after TimeControl build"
+          if ! git push origin "HEAD:$branch"; then
+            git pull --rebase origin "$branch"
+            git push origin "HEAD:$branch"
+          fi
