@@ -1,0 +1,79 @@
+name: Duck Hunt Retro - Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'DuckHuntRetro.zip'
+      - '.github/workflows/duckhunt-retro-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duckhunt-retro-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Duck Hunt Retro APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract game source archive
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f DuckHuntRetro.zip || { echo '::error::DuckHuntRetro.zip not found in repository root'; exit 1; }
+          work="$RUNNER_TEMP/duckhunt-project"
+          rm -rf "$work"
+          mkdir -p "$work"
+          unzip -oq DuckHuntRetro.zip -d "$work"
+          gradlew_path="$(find "$work" -type f -name gradlew -print -quit)"
+          test -n "$gradlew_path" || { echo '::error::gradlew was not found in DuckHuntRetro.zip'; exit 1; }
+          project_dir="$(dirname "$gradlew_path")"
+          test -f "$project_dir/settings.gradle" -o -f "$project_dir/settings.gradle.kts"
+          test -d "$project_dir/app"
+          echo "directory=$project_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          # No Gradle cache here: the build files are extracted from the ZIP.
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+
+      - name: Build debug APK
+        working-directory: ${{ steps.source.outputs.directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon clean assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: duck-hunt-retro-debug-apk
+          path: ${{ steps.source.outputs.directory }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean generated workspace (always, on success or failure)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          rm -rf "$RUNNER_TEMP/duckhunt-project"
+          git clean -ffdx
+          exit 0
