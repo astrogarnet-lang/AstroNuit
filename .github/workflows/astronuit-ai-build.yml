@@ -1,0 +1,185 @@
+name: AstroNuit AI - Android Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'AstroNuit-AI-Android-Foundation-0.2.4.zip'
+      - '.github/workflows/astronuit-ai-build.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: "${{ github.event_name != 'push' || !contains(github.event.head_commit.message, 'chore: clean repository after AstroNuit build') }}"
+    name: Analyze, test and build single-APK release
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Check project archive
+        run: |
+          set -euo pipefail
+          test -f AstroNuit-AI-Android-Foundation-0.2.4.zip
+          unzip -t AstroNuit-AI-Android-Foundation-0.2.4.zip
+
+      - name: Extract Flutter source
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/astronuit-source"
+          mkdir -p "$RUNNER_TEMP/astronuit-source"
+          unzip -q AstroNuit-AI-Android-Foundation-0.2.4.zip -d "$RUNNER_TEMP/astronuit-source"
+          test -f "$RUNNER_TEMP/astronuit-source/pubspec.yaml"
+          test -f "$RUNNER_TEMP/astronuit-source/tool/bootstrap_android.sh"
+
+      - name: Download and verify bundled language model
+        working-directory: ${{ runner.temp }}/astronuit-source
+        env:
+          MODEL_URL: https://huggingface.co/litert-community/Qwen3-0.6B-int4/resolve/main/qwen3_0.6b_q4_block32_ekv1280.litertlm
+          MODEL_SHA256: 312ce4e6bc0816edf844b9b7e66542648a89440b54822c3581e48a19e9ff5715
+        run: |
+          set -euo pipefail
+          mkdir -p assets/models
+          model_file="assets/models/qwen3_0.6b_q4_block32_ekv1280.litertlm"
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 \
+            --output "$model_file" "$MODEL_URL"
+          echo "$MODEL_SHA256  $model_file" | sha256sum --check -
+          model_bytes="$(stat -c '%s' "$model_file")"
+          test "$model_bytes" -gt 300000000
+          test "$model_bytes" -lt 400000000
+          echo "Verified bundled language model: ${model_bytes} bytes"
+
+      - name: Resolve dependencies
+        working-directory: ${{ runner.temp }}/astronuit-source
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Verify Android plugin graph
+        working-directory: ${{ runner.temp }}/astronuit-source
+        run: |
+          set -euo pipefail
+          python3 - <<'PYVERIFY'
+          import json
+          import re
+          from pathlib import Path
+
+          lock_text = Path('pubspec.lock').read_text(encoding='utf-8')
+          match = re.search(
+              r'^  path_provider_android:\n(?:    .*\n)*?    version: ["\']?([^"\'\n]+)',
+              lock_text,
+              re.MULTILINE,
+          )
+          if not match:
+              raise SystemExit('ERROR: path_provider_android was not resolved.')
+          version = match.group(1).strip()
+          if version != '2.2.23':
+              raise SystemExit(
+                  f'ERROR: expected path_provider_android 2.2.23 without JNI, got {version}.'
+              )
+
+          plugin_file = Path('.flutter-plugins-dependencies')
+          if not plugin_file.exists():
+              raise SystemExit('ERROR: Flutter did not generate .flutter-plugins-dependencies.')
+          plugin_data = json.loads(plugin_file.read_text(encoding='utf-8'))
+          android = plugin_data.get('plugins', {}).get('android', [])
+          names = {item.get('name') for item in android}
+          if 'jni_flutter' in names:
+              raise SystemExit(
+                  'ERROR: jni_flutter is still registered on Android; refusing to build an APK '
+                  'that can fail loading libdartjni.so.'
+              )
+          if 'path_provider_android' not in names:
+              raise SystemExit('ERROR: path_provider_android is missing from Android plugin registration.')
+          if 'sqflite_android' not in names:
+              raise SystemExit('ERROR: sqflite_android is missing from Android plugin registration.')
+          print('Android plugins verified: path_provider_android 2.2.23; sqflite_android present; jni_flutter absent.')
+          PYVERIFY
+
+      - name: Analyze Dart source
+        working-directory: ${{ runner.temp }}/astronuit-source
+        run: flutter analyze --no-pub
+
+      - name: Run Flutter tests
+        working-directory: ${{ runner.temp }}/astronuit-source
+        run: flutter test --no-pub
+
+      - name: Prepare Android project
+        working-directory: ${{ runner.temp }}/astronuit-source
+        run: bash tool/bootstrap_android.sh
+
+      - name: Build single release APK with bundled model
+        working-directory: ${{ runner.temp }}/astronuit-source
+        run: flutter build apk --release --no-pub
+
+      - name: Verify APK native plugins and bundled model
+        working-directory: ${{ runner.temp }}/astronuit-source
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$apk"
+          apk_contents="$(unzip -Z1 "$apk")"
+          grep -F 'flutter_assets/assets/models/qwen3_0.6b_q4_block32_ekv1280.litertlm' <<< "$apk_contents"
+          if grep -Fq 'libdartjni.so' <<< "$apk_contents"; then
+            echo "::error::APK still contains libdartjni.so. The failing JNI plugin must not be packaged."
+            exit 1
+          fi
+          grep -F 'lib/arm64-v8a/libapp.so' <<< "$apk_contents"
+          grep -F 'lib/arm64-v8a/libflutter.so' <<< "$apk_contents"
+          echo "Verified: SQLite plugin graph checked, failing JNI library absent, ARM64 Flutter libraries included."
+
+      - name: Upload one-file APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: astronuit-ai-single-apk
+          path: ${{ runner.temp }}/astronuit-source/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Clean repository (always, keep only .github)
+        if: always() && steps.checkout.outcome == 'success'
+        env:
+          TARGET_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Remove every repository item at the root except Git metadata and .github.
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name '.github' \
+            -exec rm -rf -- {} +
+
+          # Remove extracted source and model files from runner temp storage.
+          rm -rf "$RUNNER_TEMP/astronuit-source"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Repository already contains only .github; no cleanup commit needed."
+          else
+            git commit -m "chore: clean repository after AstroNuit build"
+            if [[ "$TARGET_REF" == refs/heads/* ]]; then
+              git push origin "HEAD:${TARGET_REF}"
+            else
+              echo "::warning::Cleanup was committed locally but not pushed: workflow ref is not a branch ($TARGET_REF)."
+            fi
+          fi
