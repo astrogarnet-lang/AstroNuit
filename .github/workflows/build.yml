@@ -1,0 +1,182 @@
+name: AstroNuit — Android APK
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: astronuit-build-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    name: Validate data and build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+      - name: Set up Python and Node
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Extract project source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -f source.zip ]]; then ARCHIVE=source.zip; elif [[ -f .github/source.zip ]]; then ARCHIVE=.github/source.zip; else echo 'Required source.zip is missing.' >&2; exit 1; fi
+          unzip -tq "$ARCHIVE"
+          mkdir -p src
+          unzip -q "$ARCHIVE" -d src
+      - name: Audit application identity and source syntax
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if grep -RInE 'Starwalk|STARWALK|starwalk|com\.astronuit\.starwalk' src --exclude='*.pyc'; then
+            echo 'An obsolete product identifier remains in the source.' >&2
+            exit 1
+          fi
+          python3 -m py_compile src/prepare_catalog.py src/tools_download_nasa_visuals.py src/make_planet_thumbnails.py
+          bash -n src/download_official_assets.sh
+          python3 - <<'PY'
+          import json, pathlib, re, xml.etree.ElementTree as ET
+          root=pathlib.Path('src')
+          assets=root/'app/src/main/assets'
+          for p in assets.rglob('*.json'):
+              json.loads(p.read_text(encoding='utf-8'))
+          html=(assets/'index.html').read_text(encoding='utf-8')
+          scripts=[]
+          for attrs, code in re.findall(r'<script\b([^>]*)>(.*?)</script>', html, re.I|re.S):
+              if re.search(r'type\s*=\s*["\']application/json["\']', attrs, re.I): continue
+              if re.search(r'\bsrc\s*=', attrs, re.I): continue
+              if code.strip(): scripts.append(code)
+          if not scripts: raise SystemExit('No inline JavaScript was found.')
+          pathlib.Path('ci-inline.js').write_text('\n'.join(scripts),encoding='utf-8')
+          ET.parse(root/'app/src/main/AndroidManifest.xml')
+          gradle=(root/'app/build.gradle').read_text(encoding='utf-8')
+          if "namespace 'com.astronuit.app'" not in gradle or "applicationId 'com.astronuit.app'" not in gradle:
+              raise SystemExit('Android package identity is not AstroNuit.')
+          print('JSON, Android manifest, identity and Python source passed.')
+          PY
+          node --check ci-inline.js
+      - name: Prepare image processing tools
+        run: python3 -m pip install --disable-pip-version-check Pillow
+      - name: Download verified planetary maps, NASA images and sky catalogues
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd src
+          chmod +x download_official_assets.sh gradlew
+          ./download_official_assets.sh
+          python3 prepare_catalog.py
+      - name: Verify prepared astronomy data
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          d=json.loads(pathlib.Path('src/app/src/main/assets/data/catalog.json').read_text(encoding='utf-8'))
+          assert len(d.get('stars',[])) >= 5000, f"Too few stars: {len(d.get('stars',[]))}"
+          assert len(d.get('constellation_lines',[])) >= 80, 'Official constellation line data is incomplete.'
+          assert d.get('nebula_photo_count',0) >= 6, 'Fewer than six object-specific NASA images were validated.'
+          assets=pathlib.Path('src/app/src/main/assets')
+          from PIL import Image
+          runtime=assets/'textures/runtime'
+          expected=['mercury.jpg','venus_clouds.jpg','venus_surface.jpg','earth.jpg','mars.jpg','jupiter.jpg','saturn.jpg','uranus.jpg','neptune.jpg','pluto.jpg','sun.jpg','moon.jpg']
+          for name in expected:
+              with Image.open(runtime/name) as im:
+                  assert im.size == (2048,1024), f"Unexpected runtime map size: {name} {im.size}"
+          for name in ['earth_clouds_2k.jpg','earth_night_2k.jpg']:
+              with Image.open(assets/'textures/reduced'/name) as im:
+                  assert im.size == (2048,1024), f"Unexpected Earth layer size: {name} {im.size}"
+          with Image.open(runtime/'saturn_ring_alpha.png') as ring:
+              assert ring.width <= 2048 and ring.width >= 1024, f"Invalid Saturn ring texture: {ring.size}"
+          manifest=json.loads((assets/'data/nebula_photo_manifest.json').read_text(encoding='utf-8'))
+          ids={x.get('nasaId') for x in manifest if x.get('nasaId')}
+          assert len(ids) >= 6, 'NASA deep-sky image IDs are not sufficiently distinct.'
+          print(f"Validated {len(d['stars'])} stars, {len(d['constellation_lines'])} constellations, {d['nebula_photo_count']} unique deep-sky photographs and all runtime planet maps.")
+          html=(assets/'index.html').read_text(encoding='utf-8')
+          blocks=[]
+          import re
+          for attrs, code in re.findall(r'<script\b([^>]*)>(.*?)</script>', html, re.I|re.S):
+              if re.search(r'type\s*=\s*["\']application/json["\']', attrs, re.I): continue
+              if re.search(r'\bsrc\s*=', attrs, re.I): continue
+              if code.strip(): blocks.append(code)
+          if len(blocks)!=1: raise SystemExit(f'Expected one inline application script, got {len(blocks)}.')
+          pathlib.Path('ci-inline.js').write_text('\n'.join(blocks),encoding='utf-8')
+          PY
+          node --check ci-inline.js
+      - name: Build AstroNuit APK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd src
+          gradle --no-daemon --stacktrace :app:assembleDebug
+          mkdir -p ../dist
+          cp app/build/outputs/apk/debug/app-debug.apk ../dist/AstroNuit-debug.apk
+          cp README_RU.md ../dist/README_RU.md
+      - name: Upload AstroNuit APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AstroNuit-Android-APK
+          path: dist/*
+          if-no-files-found: error
+  cleanup:
+    name: Retain only workflow and source archive
+    needs: build
+    if: ${{ always() && github.ref_type == 'branch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - name: Preserve build input and clean repository
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3 4 5 6 7 8; do
+            git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+            git reset --hard "refs/remotes/origin/${TARGET_BRANCH}"
+            mkdir -p .github
+            if [[ -f source.zip ]]; then install -m 0644 source.zip .github/source.zip; fi
+            [[ -s .github/source.zip ]] || { echo 'Preserved source.zip is missing.' >&2; exit 1; }
+            unzip -tq .github/source.zip
+            [[ -f .github/workflows/build.yml ]] || { echo 'Build workflow is missing.' >&2; exit 1; }
+            find . -mindepth 1 -maxdepth 1 ! -name .github ! -name .git -exec rm -rf -- {} +
+            git add -A
+            if git diff --cached --quiet; then exit 0; fi
+            git commit -m 'chore: retain AstroNuit build workflow and source [skip ci]'
+            if git push origin "HEAD:refs/heads/${TARGET_BRANCH}"; then exit 0; fi
+            sleep "$((attempt * 2))"
+          done
+          echo 'Could not push repository cleanup after 8 attempts.' >&2
+          exit 1
