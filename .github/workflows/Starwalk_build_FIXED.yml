@@ -1,0 +1,197 @@
+name: Build Starwalk (Android)
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Locate, preserve and extract source archive
+        id: prepare
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BACKUP="$RUNNER_TEMP/starwalk-source.zip"
+          if [[ -f .github/source.zip ]]; then
+            cp -- .github/source.zip "$BACKUP"
+            echo 'Using .github/source.zip.'
+          elif [[ -f source.zip ]]; then
+            cp -- source.zip "$BACKUP"
+            echo 'Using root-level source.zip.'
+          else
+            # Also accept the outer delivery archive (for example DELIVERY_05_Starwalk_Android.zip)
+            # when it contains source.zip as a member.
+            FOUND_OUTER=''
+            while IFS= read -r candidate; do
+              ENTRY="$(unzip -Z1 "$candidate" 2>/dev/null | awk '$0 == "source.zip" || $0 ~ /\/source\.zip$/ { print; exit }' || true)"
+              if [[ -n "$ENTRY" ]]; then
+                if unzip -p "$candidate" "$ENTRY" > "$BACKUP" && [[ -s "$BACKUP" ]]; then
+                  FOUND_OUTER="$candidate"
+                  break
+                fi
+              fi
+            done < <(find . -maxdepth 1 -type f -name '*.zip' ! -name 'source.zip' -print | sort)
+            if [[ -z "$FOUND_OUTER" ]]; then
+              echo 'Source archive not found. Expected .github/source.zip, root source.zip, or a delivery ZIP containing source.zip.' >&2
+              exit 1
+            fi
+            echo "Extracted source.zip from outer delivery archive: $FOUND_OUTER"
+          fi
+          echo "Saved source archive to runner temp for safe cleanup."
+          SRC="$RUNNER_TEMP/starwalk-source"
+          rm -rf -- "$SRC"
+          mkdir -p "$SRC"
+          unzip -t "$BACKUP"
+          unzip -q "$BACKUP" -d "$SRC"
+          FLUTTER_MANIFEST="$(find "$SRC" -type f -name pubspec.yaml -not -path '*/.dart_tool/*' -not -path '*/build/*' -print -quit || true)"
+          if [[ -n "$FLUTTER_MANIFEST" ]]; then
+            ROOT="$(dirname "$FLUTTER_MANIFEST")"
+            PROJECT_TYPE='flutter'
+          else
+            WRAPPER="$(find "$SRC" -type f -name gradlew -not -path '*/.gradle/*' -print -quit || true)"
+            if [[ -z "$WRAPPER" ]]; then
+              echo 'No pubspec.yaml (Flutter) or gradlew (Gradle) was found in source.zip.' >&2
+              exit 1
+            fi
+            ROOT="$(dirname "$WRAPPER")"
+            PROJECT_TYPE='gradle'
+          fi
+          echo "project_type=$PROJECT_TYPE" >> "$GITHUB_OUTPUT"
+
+          echo "source_root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Source root for Starwalk: $ROOT"
+      - name: Set up Flutter
+        if: steps.prepare.outputs.project_type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Flutter APK
+        if: steps.prepare.outputs.project_type == 'flutter'
+        shell: bash
+        env:
+          SOURCE_ROOT: ${{ steps.prepare.outputs.source_root }}
+        run: |
+          set -Eeuo pipefail
+          cd "$SOURCE_ROOT"
+          flutter pub get
+          flutter build apk --release
+
+      - name: Build Gradle APK
+        if: steps.prepare.outputs.project_type == 'gradle'
+        shell: bash
+        env:
+          SOURCE_ROOT: ${{ steps.prepare.outputs.source_root }}
+        run: |
+          set -Eeuo pipefail
+          cd "$SOURCE_ROOT"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Collect APK artifacts
+        if: success()
+        shell: bash
+        env:
+          SOURCE_ROOT: ${{ steps.prepare.outputs.source_root }}
+        run: |
+          set -Eeuo pipefail
+          DEST="$RUNNER_TEMP/starwalk-artifacts"
+          mkdir -p "$DEST"
+          count=0
+          while IFS= read -r -d '' apk; do
+            name="$(basename "$apk")"
+            target="$DEST/$name"
+            if [[ -e "$target" ]]; then target="$DEST/${{ github.run_number }}-$count-$name"; fi
+            cp -- "$apk" "$target"
+            count=$((count + 1))
+          done < <(find "$SOURCE_ROOT" -type f -name '*.apk' -not -path '*/.gradle/*' -print0)
+          if [[ "$count" -eq 0 ]]; then echo 'Build completed but no APK was produced.' >&2; exit 1; fi
+          echo "Collected $count APK file(s)."
+
+      - name: Upload Android APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: starwalk-android-${{ github.run_number }}
+          path: ${{ runner.temp }}/starwalk-artifacts/*.apk
+          if-no-files-found: error
+
+      - name: Cleanup repository safely (retain .github and source archive)
+        if: always() && steps.checkout.outcome == 'success' && steps.prepare.outcome == 'success'
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "${{ github.ref_type }}" != 'branch' ]]; then
+            echo 'Skipping repository cleanup for a tag ref.'
+            exit 0
+          fi
+          if [[ -z "${TARGET_BRANCH}" ]]; then
+            echo 'Could not determine the branch to clean.' >&2
+            exit 1
+          fi
+          BACKUP="$RUNNER_TEMP/starwalk-source.zip"
+          if [[ ! -s "$BACKUP" ]]; then
+            echo "Preserved source archive is missing at $BACKUP; refusing destructive cleanup." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Refresh from the current remote tip on every attempt to avoid stale-parent pushes.
+          for attempt in {1..8}; do
+            echo "Cleanup push attempt ${attempt}/8"
+            if ! git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"; then
+              sleep $((attempt * 2))
+              continue
+            fi
+            if ! git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"; then
+              sleep $((attempt * 2))
+              continue
+            fi
+
+            # Preserve the source for the next run even when it originally lived at repository root.
+            mkdir -p .github
+            cp -- "$BACKUP" .github/source.zip
+
+            find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf -- {} +
+            git add -A
+            if git diff --cached --quiet; then
+              echo 'Repository already contains only .github and the preserved source archive.'
+              exit 0
+            fi
+            git commit -m 'chore: retain workflow and source archive only [skip ci]'
+            if git push origin "HEAD:refs/heads/${TARGET_BRANCH}"; then
+              echo 'Cleanup committed successfully.'
+              exit 0
+            fi
+            echo 'Push rejected; refreshing remote state and retrying.' >&2
+            sleep $((attempt * 2))
+          done
+          echo 'Cleanup failed after 8 attempts. Check branch protection and Actions contents:write permission.' >&2
+          exit 1
