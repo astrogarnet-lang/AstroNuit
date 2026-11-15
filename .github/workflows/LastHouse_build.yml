@@ -1,0 +1,91 @@
+name: Last House — Windows Portable
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Verify HTML game and package portable ZIP
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Extract project source ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = if (Test-Path 'source.zip') { 'source.zip' } elseif (Test-Path '.github/source.zip') { '.github/source.zip' } else { throw 'source.zip is missing' }
+          Expand-Archive -Path $archive -DestinationPath 'src' -Force
+      - name: Static JavaScript syntax audit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import pathlib, re
+          html = pathlib.Path('src/index.html').read_text(encoding='utf-8')
+          scripts = re.findall(r'<script\b[^>]*>(.*?)</script>', html, re.I | re.S)
+          code = '\n'.join(part for part in scripts if part.strip())
+          if not code:
+              raise SystemExit('No inline JavaScript found in src/index.html')
+          pathlib.Path('game-inline.js').write_text(code, encoding='utf-8')
+          '@ | Set-Content -Path extract_game.py -Encoding UTF8
+          python extract_game.py
+          node --check game-inline.js
+      - name: Package portable HTML game
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (!(Test-Path 'src/index.html')) { throw 'src/index.html is missing' }
+          New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
+          $items = @('src/index.html')
+          if (Test-Path 'src/README_RU.txt') { $items += 'src/README_RU.txt' }
+          Compress-Archive -Path $items -DestinationPath 'dist/LastHouse-Windows-Portable.zip' -Force
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LastHouse-Windows-Portable
+          path: dist/LastHouse-Windows-Portable.zip
+          if-no-files-found: error
+  cleanup:
+    name: Keep only .github after build (also on failure)
+    needs: build
+    if: ${{ always() && github.ref_type == 'branch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - name: Preserve source ZIP inside .github and clean repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github
+          if [[ -f source.zip ]]; then
+            cp source.zip .github/source.zip
+          elif [[ -f .github/source.zip ]]; then
+            echo 'Using previously preserved .github/source.zip'
+          else
+            echo 'ERROR: source.zip is missing; cannot preserve repeatable build input.' >&2
+            exit 1
+          fi
+          find . -mindepth 1 -maxdepth 1 ! -name .github ! -name .git -exec rm -rf -- {} +
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: retain workflow and source archive only [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          else
+            echo 'Repository already contains only .github.'
+          fi
